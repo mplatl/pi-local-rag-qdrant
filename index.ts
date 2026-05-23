@@ -100,6 +100,7 @@ interface RagConfig {
   extraExtensions: string[];
   excludeExtensions: string[];
   defaultCollection: string;
+  defaultCollections?: string[];  // optional: search multiple collections simultaneously
 }
 
 interface ScoredChunk {
@@ -142,6 +143,7 @@ function defaultConfig(): RagConfig {
     extraExtensions: [],
     excludeExtensions: [],
     defaultCollection: DEFAULT_COLLECTION,
+    defaultCollections: [],
   };
 }
 
@@ -492,82 +494,98 @@ export async function hybridSearch(
   alpha = 0.4,
   threshold = 0.1
 ): Promise<ScoredChunk[]> {
-  const qdrant = getQdrant();
+  return hybridSearchMulti(query, [collection], limit, alpha, threshold);
+}
 
-  // Check if collection exists
-  if (!(await collectionExists(collection))) return [];
+// ─── Multi-Collection Search ────────────────────────────────────────────────
 
+export async function hybridSearchMulti(
+  query: string,
+  collections: string[],
+  limit = 10,
+  alpha = 0.4,
+  threshold = 0.1
+): Promise<ScoredChunk[]> {
+  const allChunks: ScoredChunk[] = [];
+
+  // Embed query once, reuse for all collections
   const queryVec = await embed(query);
 
-  // Oversample from Qdrant to give BM25 more candidates to re-rank
-  let qdrantResults: Array<{
-    id: string | number;
-    score: number;
-    payload?: Record<string, unknown> | null;
-  }>;
+  for (const collection of collections) {
+    if (!(await collectionExists(collection))) continue;
 
-  try {
-    qdrantResults = await qdrant.search(collection, {
-      vector: queryVec,
-      limit: Math.max(limit * 5, 50),
-      with_payload: true,
-      with_vector: false,
-      score_threshold: 0, // get all, we do our own thresholding
-    });
-  } catch {
-    return [];
+    const qdrant = getQdrant();
+    let qdrantResults: Array<{
+      id: string | number;
+      score: number;
+      payload?: Record<string, unknown> | null;
+    }>;
+
+    try {
+      qdrantResults = await qdrant.search(collection, {
+        vector: queryVec,
+        limit: Math.max(limit * 3, 30),
+        with_payload: true,
+        with_vector: false,
+        score_threshold: 0,
+      });
+    } catch {
+      continue;
+    }
+
+    if (!qdrantResults.length) continue;
+
+    const chunks: ScoredChunk[] = qdrantResults
+      .filter(r => r.payload)
+      .map(r => ({
+        id: `${collection}::${String(r.id)}`,
+        file: String(r.payload!.file ?? ""),
+        content: String(r.payload!.content ?? ""),
+        lineStart: Number(r.payload!.lineStart ?? 1),
+        lineEnd: Number(r.payload!.lineEnd ?? 1),
+        tokens: Number(r.payload!.tokens ?? 0),
+        vector: r.score,
+        bm25: 0,
+        hybrid: 0,
+      }));
+
+    allChunks.push(...chunks);
   }
 
-  if (!qdrantResults.length) return [];
+  if (!allChunks.length) return [];
 
-  // Extract chunks from Qdrant payloads
-  const chunks: ScoredChunk[] = qdrantResults
-    .filter(r => r.payload)
-    .map(r => ({
-      id: String(r.id),
-      file: String(r.payload!.file ?? ""),
-      content: String(r.payload!.content ?? ""),
-      lineStart: Number(r.payload!.lineStart ?? 1),
-      lineEnd: Number(r.payload!.lineEnd ?? 1),
-      tokens: Number(r.payload!.tokens ?? 0),
-      vector: r.score, // Qdrant cosine similarity score
-      bm25: 0,
-      hybrid: 0,
-    }));
-
-  // ── BM25 re-ranking on Qdrant results ──
+  // ── Global BM25 re-ranking across all collections ──
   const terms = query.toLowerCase().split(/\s+/).filter(t => t.length > 1);
   const queryLower = query.toLowerCase();
 
   const idfMap = new Map<string, number>();
   for (const term of terms) {
-    const docsWithTerm = chunks.filter(c => c.content.toLowerCase().includes(term)).length;
-    idfMap.set(term, Math.log(1 + chunks.length / (1 + docsWithTerm)));
+    const docsWithTerm = allChunks.filter(c => c.content.toLowerCase().includes(term)).length;
+    idfMap.set(term, Math.log(1 + allChunks.length / (1 + docsWithTerm)));
   }
 
-  const bm25Raw = chunks.map(chunk => {
+  const bm25Raw = allChunks.map(chunk => {
     const lower = chunk.content.toLowerCase();
     let score = 0;
     for (const term of terms) {
       const count = (lower.match(new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) || []).length;
       if (count > 0) score += Math.log(1 + count) * (idfMap.get(term) ?? 0);
     }
-    if (lower.includes(queryLower)) score *= 2;       // exact phrase boost
-    if (chunk.file.toLowerCase().includes(terms[0] ?? "")) score *= 1.5; // filename boost
+    if (lower.includes(queryLower)) score *= 2;
+    if (chunk.file.toLowerCase().includes(terms[0] ?? "")) score *= 1.5;
     return score;
   });
 
   const bm25Norm = normalize(bm25Raw);
-  const vectorNorm = normalize(chunks.map(c => c.vector));
+  const vectorNorm = normalize(allChunks.map(c => c.vector));
 
-  // ── Hybrid scoring ──
-  for (let i = 0; i < chunks.length; i++) {
-    chunks[i].bm25 = bm25Norm[i];
-    chunks[i].vector = vectorNorm[i];
-    chunks[i].hybrid = alpha * bm25Norm[i] + (1 - alpha) * vectorNorm[i];
+  for (let i = 0; i < allChunks.length; i++) {
+    allChunks[i].bm25 = bm25Norm[i];
+    allChunks[i].vector = vectorNorm[i];
+    allChunks[i].hybrid = alpha * bm25Norm[i] + (1 - alpha) * vectorNorm[i];
   }
 
-  return chunks
+  return allChunks
     .filter(s => s.hybrid >= threshold)
     .sort((a, b) => b.hybrid - a.hybrid)
     .slice(0, limit);
@@ -583,12 +601,13 @@ export default function (pi: ExtensionAPI) {
     const config = loadConfig();
     if (!config.ragEnabled) return;
 
-    const collection = config.defaultCollection;
-    if (!(await collectionExists(collection))) return;
+    const collections = (config.defaultCollections && config.defaultCollections.length > 0)
+      ? config.defaultCollections
+      : [config.defaultCollection];
 
-    const results = await hybridSearch(
+    const results = await hybridSearchMulti(
       event.prompt,
-      collection,
+      collections,
       config.ragTopK,
       config.ragAlpha,
       config.ragScoreThreshold
@@ -600,9 +619,13 @@ export default function (pi: ExtensionAPI) {
       `\`\`\`\n${r.content.slice(0, 600)}\n\`\`\``
     ).join("\n\n");
 
+    const collLabel = collections.length === 1
+      ? `collection: ${collections[0]}`
+      : `collections: ${collections.join(", ")}`;
+
     return {
       systemPrompt: event.systemPrompt +
-        `\n\n## Relevant Codebase Context (pi-local-rag-qdrant · collection: ${collection})\n` +
+        `\n\n## Relevant Codebase Context (pi-local-rag-qdrant · ${collLabel})\n` +
         `*Retrieved ${results.length} chunks via hybrid search (BM25 + vector)*\n\n` +
         context,
     };
@@ -615,14 +638,25 @@ export default function (pi: ExtensionAPI) {
       const parts = (args || "").trim().split(/\s+/);
       const cmd = parts[0] || "status";
 
-      // Helper: extract --collection flag from args
-      function extractCollection(parts: string[]): { collection: string; rest: string[] } {
+      // Helper: extract --collection and --collections flags from args
+      function extractCollections(parts: string[]): { collections: string[]; rest: string[] } {
+        // --collections col1,col2,col3  (comma-separated, takes precedence)
+        const collsIdx = parts.indexOf("--collections");
+        if (collsIdx >= 0 && collsIdx + 1 < parts.length) {
+          const cols = parts[collsIdx + 1].split(",").map(c => c.trim()).filter(c => c);
+          return { collections: cols, rest: parts.filter((_, i) => i !== collsIdx && i !== collsIdx + 1) };
+        }
+        // --collection single
         const collIdx = parts.indexOf("--collection");
         if (collIdx >= 0 && collIdx + 1 < parts.length) {
-          const col = parts[collIdx + 1];
-          return { collection: col, rest: parts.filter((_, i) => i !== collIdx && i !== collIdx + 1) };
+          return { collections: [parts[collIdx + 1]], rest: parts.filter((_, i) => i !== collIdx && i !== collIdx + 1) };
         }
-        return { collection: loadConfig().defaultCollection, rest: parts };
+        // Fall back to defaultCollection(s)
+        const config = loadConfig();
+        if (config.defaultCollections && config.defaultCollections.length > 0) {
+          return { collections: config.defaultCollections, rest: parts };
+        }
+        return { collections: [config.defaultCollection], rest: parts };
       }
 
       // ── collection management ──
@@ -708,7 +742,8 @@ export default function (pi: ExtensionAPI) {
       }
 
       // For index/search/status/rebuild/clear, extract --collection
-      const { collection, rest } = extractCollection(parts);
+      const { collections: cmdCollections, rest } = extractCollections(parts);
+      const collection = cmdCollections[0]; // keep for single-collection log messages
 
       // ── index ──
       if (cmd === "index") {
@@ -755,19 +790,29 @@ export default function (pi: ExtensionAPI) {
       // ── search ──
       if (cmd === "search") {
         const query = rest.slice(1).join(" ");
-        if (!query) { ctx.ui.notify("Usage: /rag search <query> [--collection <name>]", "warning"); return; }
-        if (!(await collectionExists(collection))) {
-          ctx.ui.notify(`Collection "${collection}" does not exist. Run /rag index --collection ${collection} <path> first.`, "warning");
+        if (!query) { ctx.ui.notify("Usage: /rag search <query> [--collection <name>] [--collections <c1,c2>]", "warning"); return; }
+        // Re-extract for search to get the full collections list
+        const searchCols = extractCollections(parts);
+        const colls = searchCols.collections;
+
+        // Verify at least one collection exists
+        let anyExist = false;
+        for (const c of colls) {
+          if (await collectionExists(c)) { anyExist = true; break; }
+        }
+        if (!anyExist) {
+          ctx.ui.notify(`None of the collections [${colls.join(", ")}] exist.`, "warning");
           return;
         }
 
         const config = loadConfig();
-        const results = await hybridSearch(query, collection, 10, config.ragAlpha, config.ragScoreThreshold);
-        if (!results.length) { ctx.ui.notify(`No results for "${query}" in "${collection}"`, "warning"); return; }
+        const results = await hybridSearchMulti(searchCols.rest.slice(1).join(" "), colls, 10, config.ragAlpha, config.ragScoreThreshold);
+        if (!results.length) { ctx.ui.notify(`No results for "${query}" in [${colls.join(", ")}]`, "warning"); return; }
 
         const th = ctx.ui.theme;
+        const collLabel = colls.length === 1 ? `"${colls[0]}"` : `[${colls.join(", ")}]`;
         const lines: string[] = [
-          th.bold(th.fg("accent", "🔍 ") + `${results.length} results for "${query}" in "${collection}"`) +
+          th.bold(th.fg("accent", "🔍 ") + `${results.length} results for "${query}" in ${collLabel}`) +
             "  " + th.fg("dim", "hybrid BM25+vector"),
           "",
         ];
@@ -1045,14 +1090,31 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       query: Type.String({ description: "Search query" }),
       collection: Type.Optional(Type.String({ description: "Collection to search (default: configured default collection)" })),
+      collections: Type.Optional(Type.Array(Type.String(), { description: "Multiple collections to search simultaneously. Overrides 'collection' if provided." })),
       limit: Type.Optional(Type.Number({ description: "Max results (default 10)" })),
     }),
     execute: async (_toolCallId, params) => {
-      const coll = params.collection ?? loadConfig().defaultCollection;
-      if (!(await collectionExists(coll))) return { content: [{ type: "text" as const, text: `Collection "${coll}" does not exist. Run rag_index with a collection parameter first.` }], details: {} };
       const config = loadConfig();
-      const results = await hybridSearch(params.query, coll, params.limit ?? 10, config.ragAlpha, config.ragScoreThreshold);
-      if (!results.length) return { content: [{ type: "text" as const, text: `No results for "${params.query}" in collection "${coll}"` }], details: {} };
+      let colls: string[];
+      if (params.collections && params.collections.length > 0) {
+        colls = params.collections;
+      } else if (params.collection) {
+        colls = [params.collection];
+      } else if (config.defaultCollections && config.defaultCollections.length > 0) {
+        colls = config.defaultCollections;
+      } else {
+        colls = [config.defaultCollection];
+      }
+
+      // Verify at least one collection exists
+      let anyExist = false;
+      for (const c of colls) {
+        if (await collectionExists(c)) { anyExist = true; break; }
+      }
+      if (!anyExist) return { content: [{ type: "text" as const, text: `None of the collections [${colls.join(", ")}] exist. Run rag_index with a collection parameter first.` }], details: {} };
+
+      const results = await hybridSearchMulti(params.query, colls, params.limit ?? 10, config.ragAlpha, config.ragScoreThreshold);
+      if (!results.length) return { content: [{ type: "text" as const, text: `No results for "${params.query}" in collections [${colls.join(", ")}]` }], details: {} };
       const text = JSON.stringify(results.map(r => ({
         file: r.file,
         lines: `${r.lineStart}-${r.lineEnd}`,
